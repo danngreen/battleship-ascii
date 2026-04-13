@@ -17,6 +17,9 @@ interface Props {
   mySubCells?: Vec3[];
   enemySubCells?: Vec3[];
   torpedoPreview?: Vec3[];
+  subHitsFresh?: Vec3[];
+  subHitsFaded?: Vec3[];
+  clusterPreview?: Vec3[];
 }
 
 export function GridView({
@@ -31,11 +34,24 @@ export function GridView({
   mySubCells = [],
   enemySubCells = [],
   torpedoPreview = [],
+  subHitsFresh = [],
+  subHitsFaded = [],
+  clusterPreview = [],
 }: Props) {
   const shipCells = new Set(placed.flatMap((s) => s.cells.map(keyOf)));
-  const ownDamageSet = new Set(
-    placed.flatMap((s) => s.cells.filter((_, i) => s.damage?.[i]).map(keyOf)),
+  const ownSubDamageSet = new Set(
+    placed
+      .filter((s) => s.shipClass === "submarine")
+      .flatMap((s) => s.cells.filter((_, i) => s.damage?.[i]).map(keyOf)),
   );
+  const ownDamageSet = new Set(
+    placed
+      .filter((s) => s.shipClass !== "submarine")
+      .flatMap((s) => s.cells.filter((_, i) => s.damage?.[i]).map(keyOf)),
+  );
+  const subHitFreshSet = new Set(subHitsFresh.map(keyOf));
+  const subHitFadedSet = new Set(subHitsFaded.map(keyOf));
+  const clusterPreviewSet = new Set(clusterPreview.map(keyOf));
   const previewSet = new Set(preview.map(keyOf));
   const hitSet = new Set(hits.map(keyOf));
   const missSet = new Set(misses.map(keyOf));
@@ -55,20 +71,24 @@ export function GridView({
 
         let ch: string;
         let color: string;
-        if (ownDamageSet.has(k))      { ch = "✸"; color = "redBright"; }
+        if (ownSubDamageSet.has(k))   { ch = "✖"; color = "redBright"; }
+        else if (ownDamageSet.has(k)) { ch = "✸"; color = "redBright"; }
+        else if (subHitFreshSet.has(k)){ ch = "✸"; color = "redBright"; }
+        else if (subHitFadedSet.has(k)){ ch = "."; color = "red"; }
         else if (hitSet.has(k))       { ch = "✸"; color = "redBright"; }
         else if (missSet.has(k))      { ch = "○"; color = "gray"; }
         else if (subSet.has(k))       { ch = "◆"; color = "cyanBright"; }
         else if (enemySubSet.has(k))  { ch = "◈"; color = "redBright"; }
         else if (revealedSet.has(k))  { ch = "▲"; color = "magentaBright"; }
         else if (shipCells.has(k))    { ch = "■"; color = "whiteBright"; }
+        else if (isCursor)            { ch = "▣"; color = "greenBright"; }
         else if (previewSet.has(k))   { ch = "▢"; color = previewValid ? "greenBright" : "redBright"; }
-        else if (isCursor)            { ch = "▣"; color = "redBright"; }
+        else if (clusterPreviewSet.has(k)){ ch = "▢"; color = "yellowBright"; }
         else if (torpedoSet.has(k))   { ch = "⋯"; color = "yellowBright"; }
         else if (z >= GRID_SIZE.z - 1){ ch = "~"; color = "blueBright"; }
         else                          { ch = RAMP[z] ?? "."; color = "blue"; }
 
-        if (isCursor && ch !== "▣") color = "redBright";
+        if (isCursor && ch !== "▣") color = "greenBright";
         cells.push(<Text key={x} color={color}>{ch + " "}</Text>);
       }
       rows.push(<Box key={y}>{cells}</Box>);

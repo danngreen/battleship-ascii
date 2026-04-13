@@ -19,15 +19,17 @@ import {
 
 type Phase = "connecting" | "lobby" | "placement" | "market" | "combat" | "ended";
 
+interface SubHit { cell: Vec3; territory: "own" | "enemy" }
 interface TerritoryView {
   hits: Vec3[];
-  ownHits: Vec3[];
   misses: Vec3[];
   revealedShipCells: Vec3[];
   mySubInEnemy: Vec3[];
   enemySubCells: Vec3[];
   enemySubOn: "own" | "enemy" | null;
   torpedoTrail: { cells: Vec3[]; territory: "own" | "enemy" } | null;
+  subHitsFresh: SubHit[];
+  subHitsFaded: SubHit[];
 }
 
 const WEAPON_KEYS: WeaponId[] = ["cannon", "torpedo", "cluster_missile"];
@@ -40,11 +42,13 @@ export function App({ serverUrl }: { serverUrl: string }) {
   const [winnerId, setWinnerId] = useState<string>("");
   const [cursor, setCursor] = useState<Vec3>({ x: 0, y: 0, z: 2 });
   const [axis, setAxis] = useState<Axis>("x");
+  const [placementTerritory, setPlacementTerritory] = useState<"own" | "enemy">("own");
   const [placed, setPlaced] = useState<PlacedShip[]>([]);
   const [remaining, setRemaining] = useState<ShipClass[]>([]);
   const [enemy, setEnemy] = useState<TerritoryView>({
-    hits: [], ownHits: [], misses: [], revealedShipCells: [], mySubInEnemy: [],
+    hits: [], misses: [], revealedShipCells: [], mySubInEnemy: [],
     enemySubCells: [], enemySubOn: null, torpedoTrail: null,
+    subHitsFresh: [], subHitsFaded: [],
   });
   const [weapon, setWeapon] = useState<WeaponId>("cannon");
   const [torpedoDirIdx, setTorpedoDirIdx] = useState(0);
@@ -91,6 +95,7 @@ export function App({ serverUrl }: { serverUrl: string }) {
     if (cursor.z < currentSpec.minDepth || cursor.z > currentSpec.maxDepth) {
       setCursor((c) => ({ ...c, z: currentSpec.minDepth }));
     }
+    setPlacementTerritory("own");
   }, [phase, currentShip]);
 
   useEffect(() => {
@@ -107,35 +112,52 @@ export function App({ serverUrl }: { serverUrl: string }) {
       : false;
 
   useInput((input, key) => {
-    if (key.leftArrow)  setCursor((c) => ({ ...c, x: Math.max(0, c.x - 1) }));
-    if (key.rightArrow) setCursor((c) => ({ ...c, x: Math.min(GRID_SIZE.x - 1, c.x + 1) }));
+    const subPlacement = phase === "placement" && currentShip === "submarine";
+    if (key.leftArrow) {
+      if (subPlacement && placementTerritory === "enemy" && cursor.x === 0) {
+        setPlacementTerritory("own");
+        setCursor((c) => ({ ...c, x: GRID_SIZE.x - 1 }));
+      } else {
+        setCursor((c) => ({ ...c, x: Math.max(0, c.x - 1) }));
+      }
+    }
+    if (key.rightArrow) {
+      if (subPlacement && placementTerritory === "own" && cursor.x === GRID_SIZE.x - 1) {
+        setPlacementTerritory("enemy");
+        setCursor((c) => ({ ...c, x: 0 }));
+      } else {
+        setCursor((c) => ({ ...c, x: Math.min(GRID_SIZE.x - 1, c.x + 1) }));
+      }
+    }
     if (key.upArrow)    setCursor((c) => ({ ...c, y: Math.max(0, c.y - 1) }));
     if (key.downArrow)  setCursor((c) => ({ ...c, y: Math.min(GRID_SIZE.y - 1, c.y + 1) }));
 
     if (phase === "placement") {
-      if (input === "q" || input === "e") {
+      if (subPlacement && (input === "r" || input === "f")) {
         if (!currentSpec) return;
-        const dz = input === "e" ? 1 : -1;
+        const dz = input === "r" ? 1 : -1;
         setCursor((c) => {
           const nz = c.z + dz;
           if (nz < currentSpec.minDepth || nz > currentSpec.maxDepth) return c;
           return { ...c, z: nz };
         });
       }
-      if (key.tab) setAxis((a) => (a === "x" ? "y" : "x"));
-      if (key.return && room && currentShip) {
-        room.send("place_ship", { shipClass: currentShip, origin: cursor, axis });
+      if (key.tab && !subPlacement) setAxis((a) => (a === "x" ? "y" : "x"));
+      if ((key.return || input === " ") && room && currentShip) {
+        const territory = currentShip === "submarine" ? placementTerritory : "own";
+        room.send("place_ship", { shipClass: currentShip, origin: cursor, axis, territory });
       }
     } else if (phase === "combat") {
       if (input === "2") {
         if (weapon === "torpedo" && torpedoArmed) setTorpedoDirIdx((i) => (i + 1) % 6);
         else { setWeapon("torpedo"); setTorpedoDirIdx(0); setTorpedoArmed(true); }
-      } else {
+      } else if (input === "1" || input === "3") {
         const idx = "123".indexOf(input);
-        if (idx >= 0) { setWeapon(WEAPON_KEYS[idx]); if (WEAPON_KEYS[idx] !== "torpedo") setTorpedoArmed(false); }
+        setWeapon(WEAPON_KEYS[idx]);
+        setTorpedoArmed(false);
       }
 
-      if (input === " " && room) {
+      if ((input === " " || key.return) && room) {
         if (weapon === "torpedo") {
           const mySub = placed.find((s) => s.shipClass === "submarine");
           const dirs = mySub ? torpedoDirections(mySub.axis) : [];
@@ -148,6 +170,8 @@ export function App({ serverUrl }: { serverUrl: string }) {
           room.send("fire", { weapon, target: cursor });
         }
       }
+      const moveKey = "adwsrf".includes(input);
+      if (moveKey && room) setTorpedoArmed(false);
       if (input === "a" && room) room.send("move_sub", { delta: { x: -1, y: 0, z: 0 } });
       if (input === "d" && room) room.send("move_sub", { delta: {  x: 1, y: 0, z: 0 } });
       if (input === "w" && room) room.send("move_sub", { delta: { x: 0, y: -1, z: 0 } });
@@ -170,6 +194,16 @@ export function App({ serverUrl }: { serverUrl: string }) {
     ? torpedoPath(mySub, torpedoDir).path
     : [];
   const subTerritory = mySub?.territory ?? "own";
+  const clusterPreview: Vec3[] =
+    phase === "combat" && weapon === "cluster_missile"
+      ? [
+          { x: cursor.x,     y: cursor.y,     z: 2 },
+          { x: cursor.x + 1, y: cursor.y,     z: 2 },
+          { x: cursor.x - 1, y: cursor.y,     z: 2 },
+          { x: cursor.x,     y: cursor.y + 1, z: 2 },
+          { x: cursor.x,     y: cursor.y - 1, z: 2 },
+        ].filter((c) => c.x >= 0 && c.x < GRID_SIZE.x && c.y >= 0 && c.y < GRID_SIZE.y)
+      : [];
   const dirLabel = (d: Vec3) => {
     if (d.x !== 0) return d.x > 0 ? "+X" : "-X";
     if (d.y !== 0) return d.y > 0 ? "+Y" : "-Y";
@@ -182,11 +216,12 @@ export function App({ serverUrl }: { serverUrl: string }) {
       <Box>
         <GridView
           title="YOUR WATERS"
-          cursor={phase === "placement" ? cursor : null}
+          cursor={phase === "placement" && placementTerritory === "own" ? cursor : null}
           placed={ownShips}
-          preview={preview}
+          preview={placementTerritory === "own" ? preview : []}
           previewValid={previewValid}
-          hits={enemy.ownHits}
+          subHitsFresh={enemy.subHitsFresh.filter(h => h.territory === "own").map(h => h.cell)}
+          subHitsFaded={enemy.subHitsFaded.filter(h => h.territory === "own").map(h => h.cell)}
           enemySubCells={enemy.enemySubOn === "own" ? enemy.enemySubCells : []}
           torpedoPreview={[
             ...(showTorpedo && subTerritory === "own" ? torpedoPreviewCells : []),
@@ -196,11 +231,22 @@ export function App({ serverUrl }: { serverUrl: string }) {
         <Box marginLeft={2}>
           <GridView
             title="ENEMY WATERS"
-            cursor={phase === "combat" ? cursor : null}
+            cursor={
+              phase === "combat"
+                ? cursor
+                : phase === "placement" && placementTerritory === "enemy"
+                ? cursor
+                : null
+            }
+            preview={phase === "placement" && placementTerritory === "enemy" ? preview : []}
+            previewValid={previewValid}
             hits={enemy.hits}
             misses={enemy.misses}
             revealed={enemy.revealedShipCells}
             mySubCells={enemy.mySubInEnemy}
+            subHitsFresh={enemy.subHitsFresh.filter(h => h.territory === "enemy").map(h => h.cell)}
+            subHitsFaded={enemy.subHitsFaded.filter(h => h.territory === "enemy").map(h => h.cell)}
+            clusterPreview={clusterPreview}
             enemySubCells={enemy.enemySubOn === "enemy" ? enemy.enemySubCells : []}
             torpedoPreview={[
               ...(showTorpedo && subTerritory === "enemy" ? torpedoPreviewCells : []),
@@ -213,10 +259,10 @@ export function App({ serverUrl }: { serverUrl: string }) {
         {phase === "placement" && currentSpec ? (
           <>
             <Text color="yellowBright">
-              Placing: {currentSpec.name} (len {currentSpec.length})  axis: {axis.toUpperCase()}  z{currentSpec.minDepth}-z{currentSpec.maxDepth}
+              Placing: {currentSpec.name} (len {currentSpec.length})  {currentShip === "submarine" ? `waters: ${placementTerritory.toUpperCase()}` : `axis: ${axis.toUpperCase()}`}  z{currentSpec.minDepth}-z{currentSpec.maxDepth}
             </Text>
             <Text dimColor>
-              fleet: {placed.length}/{placed.length + remaining.length}  •  arrows=move  q/e=depth  tab=axis  enter=place
+              fleet: {placed.length}/{placed.length + remaining.length}  •  arrows=move{currentShip === "submarine" ? "/cross" : ""}  {currentShip === "submarine" ? "r/f=depth" : "tab=axis"}  space/enter=place
             </Text>
           </>
         ) : phase === "placement" ? (
@@ -232,12 +278,14 @@ export function App({ serverUrl }: { serverUrl: string }) {
             </Text>
             <Box>
               {WEAPON_KEYS.map((w, i) => (
-                <Text key={w} color={w === weapon ? "yellowBright" : "gray"}>
-                  [{i + 1}]{WEAPONS[w].name.split(" ")[0]}({fmtAmmo(ammoFor(w))})
-                </Text>
+                <Box key={w} marginRight={2}>
+                  <Text color={w === weapon ? "yellowBright" : "gray"}>
+                    [{i + 1}]{WEAPONS[w].name.split(" ")[0]}({fmtAmmo(ammoFor(w))})
+                  </Text>
+                </Box>
               ))}
             </Box>
-            <Text dimColor>arrows=aim  1-3=weapon (2 cycles torpedo dir)  space=fire</Text>
+            <Text dimColor>arrows=aim  1-3=weapon (2 cycles torpedo dir)  space/enter=fire</Text>
             <Text dimColor>wasd=move sub (xy)  r/f=sub depth</Text>
           </>
         ) : phase === "ended" ? (

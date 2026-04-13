@@ -11,6 +11,7 @@ export const PlaceShipMsg = z.object({
   shipClass: z.string(),
   origin: Vec3Schema,
   axis: z.enum(["x", "y", "z"]),
+  territory: z.enum(["own", "enemy"]).optional(),
 });
 
 const DirSchema = z.object({

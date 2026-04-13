@@ -16,7 +16,7 @@ export const SHIPS: Record<ShipClass, ShipSpec> = {
   cruiser:     { id: "cruiser",     name: "Cruiser",     length: 3, minDepth: 2, maxDepth: 2, weapons: ["cannon", "cluster_missile"] },
   battleship:  { id: "battleship",  name: "Battleship",  length: 4, minDepth: 2, maxDepth: 2, weapons: ["cannon", "cluster_missile"] },
   carrier:     { id: "carrier",     name: "Carrier",     length: 5, minDepth: 2, maxDepth: 2, weapons: ["cannon"] },
-  submarine:   { id: "submarine",   name: "Submarine",   length: 2, minDepth: 0, maxDepth: 1, weapons: ["torpedo"] },
+  submarine:   { id: "submarine",   name: "Submarine",   length: 1, minDepth: 0, maxDepth: 1, weapons: ["torpedo"] },
 };
 
 export interface WeaponSpec {

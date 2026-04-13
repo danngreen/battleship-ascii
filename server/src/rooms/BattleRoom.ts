@@ -44,10 +44,11 @@ export class BattleRoom extends Room<BattleState> {
   private remainingShips = new Map<string, ShipClass[]>();
   private revealedEnemy = new Map<string, Map<string, Vec3>>();
   private myHits = new Map<string, Map<string, Vec3>>();
-  private myOwnHits = new Map<string, Map<string, Vec3>>();
   private myMisses = new Map<string, Map<string, Vec3>>();
   private ammo = new Map<string, Map<WeaponId, number>>();
   private torpedoTrails = new Map<string, { cells: Vec3[]; territory: "own" | "enemy" }>();
+  private subHitsFresh = new Map<string, Map<string, { cell: Vec3; territory: "own" | "enemy" }>>();
+  private subHitsFaded = new Map<string, Map<string, { cell: Vec3; territory: "own" | "enemy" }>>();
 
   onCreate() {
     this.setState(new BattleState());
@@ -71,8 +72,9 @@ export class BattleRoom extends Room<BattleState> {
     this.remainingShips.set(client.sessionId, [...DEFAULT_FLEET]);
     this.revealedEnemy.set(client.sessionId, new Map());
     this.myHits.set(client.sessionId, new Map());
-    this.myOwnHits.set(client.sessionId, new Map());
     this.myMisses.set(client.sessionId, new Map());
+    this.subHitsFresh.set(client.sessionId, new Map());
+    this.subHitsFaded.set(client.sessionId, new Map());
     const inv = new Map<WeaponId, number>();
     for (const [w, n] of Object.entries(STARTER_AMMO)) inv.set(w as WeaponId, n);
     this.ammo.set(client.sessionId, inv);
@@ -90,10 +92,11 @@ export class BattleRoom extends Room<BattleState> {
     this.remainingShips.delete(client.sessionId);
     this.revealedEnemy.delete(client.sessionId);
     this.myHits.delete(client.sessionId);
-    this.myOwnHits.delete(client.sessionId);
     this.myMisses.delete(client.sessionId);
     this.ammo.delete(client.sessionId);
     this.torpedoTrails.delete(client.sessionId);
+    this.subHitsFresh.delete(client.sessionId);
+    this.subHitsFaded.delete(client.sessionId);
   }
 
   private opponentId(sessionId: string): string | undefined {
@@ -110,8 +113,19 @@ export class BattleRoom extends Room<BattleState> {
     const other = ids.find((id) => id !== this.state.turnPlayerId);
     if (other) {
       this.state.turnPlayerId = other;
+      let dirty = false;
       if (this.torpedoTrails.has(other)) {
         this.torpedoTrails.delete(other);
+        dirty = true;
+      }
+      const fresh = this.subHitsFresh.get(other);
+      const faded = this.subHitsFaded.get(other);
+      if (fresh && fresh.size > 0 && faded) {
+        for (const [k, v] of fresh) faded.set(k, v);
+        fresh.clear();
+        dirty = true;
+      }
+      if (dirty) {
         const oc = this.clientFor(other);
         if (oc) this.sendTerritoryView(oc);
       }
@@ -149,11 +163,17 @@ export class BattleRoom extends Room<BattleState> {
       mySubInEnemy.push(...sub.cells);
       if (oppId) {
         const oppShips = this.placedShips.get(oppId) ?? [];
+        const plus: Vec3[] = [];
+        for (const sc of sub.cells) {
+          for (const [dx, dy] of [[0,0],[1,0],[-1,0],[0,1],[0,-1]]) {
+            plus.push({ x: sc.x + dx, y: sc.y + dy, z: GRID_SIZE.z - 1 });
+          }
+        }
         for (const ship of oppShips) {
           if (ship.shipClass === "submarine") continue;
           for (const oc of ship.cells) {
-            for (const sc of sub.cells) {
-              if (sc.x === oc.x && sc.y === oc.y && sc.z < oc.z) {
+            for (const pc of plus) {
+              if (pc.x === oc.x && pc.y === oc.y && pc.z === oc.z) {
                 persistent.set(cellKey(oc), oc);
                 break;
               }
@@ -183,19 +203,21 @@ export class BattleRoom extends Room<BattleState> {
     }
 
     const hits = [...(this.myHits.get(client.sessionId)?.values() ?? [])];
-    const ownHits = [...(this.myOwnHits.get(client.sessionId)?.values() ?? [])];
     const misses = [...(this.myMisses.get(client.sessionId)?.values() ?? [])];
     const trail = this.torpedoTrails.get(client.sessionId) ?? null;
+    const subHitsFresh = [...(this.subHitsFresh.get(client.sessionId)?.values() ?? [])];
+    const subHitsFaded = [...(this.subHitsFaded.get(client.sessionId)?.values() ?? [])];
 
     client.send("territory_view", {
       hits,
-      ownHits,
       misses,
       revealedShipCells,
       mySubInEnemy,
       enemySubCells,
       enemySubOn,
       torpedoTrail: trail,
+      subHitsFresh,
+      subHitsFaded,
     });
   }
 
@@ -231,17 +253,19 @@ export class BattleRoom extends Room<BattleState> {
           client.send("error", { message: `invalid placement: ${result.error}` });
           return;
         }
+        const territory = shipClass === "submarine" ? (msg.territory ?? "own") : "own";
         placed.push({
           shipClass,
           origin: msg.origin,
           axis: msg.axis,
           cells: result.cells,
-          territory: "own",
+          territory,
           damage: result.cells.map(() => false),
         });
         this.remainingShips.set(client.sessionId, remaining.filter((s) => s !== shipClass));
         player.shipsPlaced = placed.length;
         this.sendFleet(client);
+        this.sendTerritoryView(client);
 
         if ((this.remainingShips.get(client.sessionId) ?? []).length === 0) {
           player.ready = true;
@@ -396,12 +420,18 @@ export class BattleRoom extends Room<BattleState> {
         }
 
         const myH = this.myHits.get(client.sessionId)!;
-        const myOH = this.myOwnHits.get(client.sessionId)!;
         const myM = this.myMisses.get(client.sessionId)!;
-        const hitsOnOwn = weaponId === "torpedo" && (mySub?.territory ?? "own") === "own";
-        for (const h of hits) {
-          if (hitsOnOwn) myOH.set(cellKey(h), h);
-          else myH.set(cellKey(h), h);
+        if (weaponId === "torpedo") {
+          const territory: "own" | "enemy" = mySub?.territory ?? "own";
+          const fresh = this.subHitsFresh.get(client.sessionId)!;
+          const faded = this.subHitsFaded.get(client.sessionId)!;
+          for (const h of hits) {
+            const k = cellKey(h);
+            faded.delete(k);
+            fresh.set(k, { cell: h, territory });
+          }
+        } else {
+          for (const h of hits) myH.set(cellKey(h), h);
         }
         if (weaponId === "torpedo") {
           if (misses.length > 0) {
