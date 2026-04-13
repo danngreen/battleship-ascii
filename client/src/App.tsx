@@ -17,7 +17,8 @@ import {
   type WeaponId,
 } from "@battleship/shared";
 
-type Phase = "connecting" | "lobby" | "placement" | "market" | "combat" | "ended";
+type Phase = "menu" | "connecting" | "lobby" | "placement" | "market" | "combat" | "ended";
+type Mode = "vs-human" | "vs-cpu-easy";
 
 interface SubHit { cell: Vec3; territory: "own" | "enemy" }
 interface TerritoryView {
@@ -35,7 +36,8 @@ interface TerritoryView {
 const WEAPON_KEYS: WeaponId[] = ["cannon", "torpedo", "cluster_missile"];
 
 export function App({ serverUrl }: { serverUrl: string }) {
-  const [phase, setPhase] = useState<Phase>("connecting");
+  const [phase, setPhase] = useState<Phase>("menu");
+  const [mode, setMode] = useState<Mode | null>(null);
   const [room, setRoom] = useState<Room | null>(null);
   const [sessionId, setSessionId] = useState<string>("");
   const [turnPlayerId, setTurnPlayerId] = useState<string>("");
@@ -57,9 +59,13 @@ export function App({ serverUrl }: { serverUrl: string }) {
   const [log, setLog] = useState<string[]>(["Booting radar…"]);
 
   useEffect(() => {
+    if (!mode) return;
     const client = new Client(serverUrl);
-    client
-      .joinOrCreate("battle", { name: process.env.USER ?? "Captain" })
+    const name = process.env.USER ?? "Captain";
+    const promise = mode === "vs-cpu-easy"
+      ? client.create("battle", { name, solo: true })
+      : client.joinOrCreate("battle", { name });
+    promise
       .then((r) => {
         setRoom(r);
         setSessionId(r.sessionId);
@@ -84,7 +90,7 @@ export function App({ serverUrl }: { serverUrl: string }) {
         });
       })
       .catch((err) => setLog((l) => [...l, `connect failed: ${err.message}`]));
-  }, [serverUrl]);
+  }, [serverUrl, mode]);
 
   const currentShip = remaining[0];
   const currentSpec = currentShip ? SHIPS[currentShip] : null;
@@ -112,6 +118,11 @@ export function App({ serverUrl }: { serverUrl: string }) {
       : false;
 
   useInput((input, key) => {
+    if (phase === "menu") {
+      if (input === "1") { setMode("vs-human"); setPhase("connecting"); }
+      if (input === "2") { setMode("vs-cpu-easy"); setPhase("connecting"); }
+      return;
+    }
     const subPlacement = phase === "placement" && currentShip === "submarine";
     if (key.leftArrow) {
       if (subPlacement && placementTerritory === "enemy" && cursor.x === 0) {
@@ -209,6 +220,18 @@ export function App({ serverUrl }: { serverUrl: string }) {
     if (d.y !== 0) return d.y > 0 ? "+Y" : "-Y";
     return d.z > 0 ? "+Z" : "-Z";
   };
+
+  if (phase === "menu") {
+    return (
+      <Box flexDirection="column">
+        <Text color="cyanBright">╔══ BATTLESHIP-ASCII • 3D TACTICAL ══╗</Text>
+        <Text> </Text>
+        <Text>Choose mode:</Text>
+        <Text color="yellowBright">  [1] VS HUMAN (online)</Text>
+        <Text color="yellowBright">  [2] VS CPU — Easy</Text>
+      </Box>
+    );
+  }
 
   return (
     <Box flexDirection="column">

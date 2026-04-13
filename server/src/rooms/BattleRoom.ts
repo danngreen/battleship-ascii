@@ -14,6 +14,9 @@ import {
   type Vec3,
   type WeaponId,
 } from "@battleship/shared";
+import { createStrategy, type AIStrategy } from "../ai/strategies.js";
+
+const AI_ID = "AI";
 const { Room } = pkg;
 type Client = import("colyseus").Client;
 
@@ -39,6 +42,8 @@ const cellKey = (c: Vec3) => `${c.x},${c.y},${c.z}`;
 
 export class BattleRoom extends Room<BattleState> {
   maxClients = 2;
+  private solo = false;
+  private ai: AIStrategy | null = null;
 
   private placedShips = new Map<string, PlacedShip[]>();
   private remainingShips = new Map<string, ShipClass[]>();
@@ -50,7 +55,12 @@ export class BattleRoom extends Room<BattleState> {
   private subHitsFresh = new Map<string, Map<string, { cell: Vec3; territory: "own" | "enemy" }>>();
   private subHitsFaded = new Map<string, Map<string, { cell: Vec3; territory: "own" | "enemy" }>>();
 
-  onCreate() {
+  onCreate(options: { solo?: boolean; aiLevel?: "easy" } = {}) {
+    this.solo = !!options.solo;
+    if (this.solo) {
+      this.maxClients = 1;
+      this.ai = createStrategy(options.aiLevel ?? "easy");
+    }
     this.setState(new BattleState());
     this.onMessage("*", (client, type, payload) => {
       const parsed = ClientMsg.safeParse({ type, ...(payload ?? {}) });
@@ -83,7 +93,41 @@ export class BattleRoom extends Room<BattleState> {
     this.sendInventory(client);
     this.sendTerritoryView(client);
 
-    if (this.state.players.size === this.maxClients) this.state.phase = "placement";
+    if (this.solo && !this.state.players.has(AI_ID)) this.synthesizeAIPlayer();
+
+    if (this.state.players.size >= 2) this.state.phase = "placement";
+  }
+
+  private synthesizeAIPlayer() {
+    const p = new PlayerState();
+    p.id = AI_ID;
+    p.name = "CPU";
+    this.state.players.set(AI_ID, p);
+
+    this.placedShips.set(AI_ID, []);
+    this.remainingShips.set(AI_ID, [...DEFAULT_FLEET]);
+    this.revealedEnemy.set(AI_ID, new Map());
+    this.myHits.set(AI_ID, new Map());
+    this.myMisses.set(AI_ID, new Map());
+    this.subHitsFresh.set(AI_ID, new Map());
+    this.subHitsFaded.set(AI_ID, new Map());
+    const inv = new Map<WeaponId, number>();
+    for (const [w, n] of Object.entries(STARTER_AMMO)) inv.set(w as WeaponId, n);
+    this.ammo.set(AI_ID, inv);
+
+    this.aiPlaceFleet();
+  }
+
+  private aiPlaceFleet() {
+    if (!this.ai) return;
+    const placed = this.ai.placeFleet();
+    this.placedShips.set(AI_ID, placed);
+    this.remainingShips.set(AI_ID, []);
+    const p = this.state.players.get(AI_ID);
+    if (p) {
+      p.ready = true;
+      p.shipsPlaced = placed.length;
+    }
   }
 
   onLeave(client: Client) {
@@ -128,6 +172,9 @@ export class BattleRoom extends Room<BattleState> {
       if (dirty) {
         const oc = this.clientFor(other);
         if (oc) this.sendTerritoryView(oc);
+      }
+      if (this.solo && other === AI_ID) {
+        this.clock.setTimeout(() => this.aiTakeTurn(), 700);
       }
     }
   }
@@ -225,6 +272,207 @@ export class BattleRoom extends Room<BattleState> {
     this.clients.forEach((c) => this.sendTerritoryView(c));
   }
 
+  private doMoveSub(sessionId: string, delta: Vec3) {
+    const client = this.clientFor(sessionId);
+    if (this.state.phase !== "combat") {
+      client?.send("error", { message: "not in combat" });
+      return;
+    }
+    if (this.state.turnPlayerId !== sessionId) {
+      client?.send("error", { message: "not your turn" });
+      return;
+    }
+    const placed = this.placedShips.get(sessionId) ?? [];
+    const sub = placed.find((s) => s.shipClass === "submarine");
+    if (!sub) { client?.send("error", { message: "no submarine" }); return; }
+    if (sub.damage && sub.damage.every((x) => x)) {
+      client?.send("error", { message: "submarine destroyed" });
+      return;
+    }
+
+    const stepSum = Math.abs(delta.x) + Math.abs(delta.y) + Math.abs(delta.z);
+    if (stepSum !== 1) { client?.send("error", { message: "invalid move" }); return; }
+
+    let newCells = sub.cells.map((c) => ({ x: c.x + delta.x, y: c.y + delta.y, z: c.z + delta.z }));
+    let crossed = false;
+    const offXMin = newCells.some((c) => c.x < 0);
+    const offXMax = newCells.some((c) => c.x >= GRID_SIZE.x);
+    if (offXMin || offXMax) {
+      newCells = sub.cells.map((c) => ({ x: GRID_SIZE.x - 1 - c.x, y: c.y, z: c.z }));
+      crossed = true;
+    }
+
+    for (const c of newCells) {
+      if (c.y < 0 || c.y >= GRID_SIZE.y) { client?.send("error", { message: "out of bounds" }); return; }
+      if (c.z < 0 || c.z > 1) { client?.send("error", { message: "submarine cannot surface" }); return; }
+    }
+
+    const currentTerritory = sub.territory ?? "own";
+    const newTerritory = crossed ? (currentTerritory === "own" ? "enemy" : "own") : currentTerritory;
+
+    if (newTerritory === "own") {
+      const others = placed.filter((s) => s !== sub);
+      const occupied = new Set(others.flatMap((s) => s.cells.map(cellKey)));
+      for (const c of newCells) {
+        if (occupied.has(cellKey(c))) { client?.send("error", { message: "collision" }); return; }
+      }
+    } else {
+      const oppId = this.opponentId(sessionId);
+      const oppSub = oppId
+        ? (this.placedShips.get(oppId) ?? []).find(
+            (s) => s.shipClass === "submarine" && (s.territory ?? "own") === "own",
+          )
+        : undefined;
+      if (oppSub) {
+        const occupied = new Set(oppSub.cells.map(cellKey));
+        for (const c of newCells) {
+          if (occupied.has(cellKey(c))) { client?.send("error", { message: "submerged collision" }); return; }
+        }
+      }
+    }
+
+    sub.cells = newCells;
+    sub.origin = newCells[0];
+    sub.territory = newTerritory;
+    if (client) this.sendFleet(client);
+    this.broadcastTerritoryViews();
+    this.flipTurn();
+  }
+
+  private doFire(sessionId: string, weaponId: WeaponId, target: Vec3, direction?: Vec3) {
+    const client = this.clientFor(sessionId);
+    if (this.state.phase !== "combat") return;
+    if (this.state.turnPlayerId !== sessionId) {
+      client?.send("error", { message: "not your turn" });
+      return;
+    }
+    const weapon = WEAPONS[weaponId];
+    if (!weapon) { client?.send("error", { message: "unknown weapon" }); return; }
+    const inv = this.ammo.get(sessionId);
+    const have = inv?.get(weaponId);
+    if (have === undefined || (have !== -1 && have <= 0)) {
+      client?.send("error", { message: "out of ammo" });
+      return;
+    }
+
+    const oppId = this.opponentId(sessionId);
+    if (!oppId) return;
+    const myPlaced = this.placedShips.get(sessionId) ?? [];
+    const oppShips = this.placedShips.get(oppId) ?? [];
+    const vulnerable = new Set<string>();
+    for (const s of oppShips) {
+      if ((s.territory ?? "own") === "own") {
+        s.cells.forEach((c) => vulnerable.add(cellKey(c)));
+      }
+    }
+
+    const mySub = myPlaced.find((s) => s.shipClass === "submarine");
+    const oppSub = oppShips.find((s) => s.shipClass === "submarine");
+    if (weaponId === "torpedo") {
+      if (!mySub || (mySub.damage && mySub.damage.every((x) => x))) {
+        client?.send("error", { message: "submarine destroyed" });
+        return;
+      }
+    }
+    const subsInSameWaters =
+      !!mySub && !!oppSub &&
+      ((mySub.territory ?? "own") !== (oppSub.territory ?? "own"));
+    const enemySubCells = subsInSameWaters && oppSub
+      ? new Set(oppSub.cells.map(cellKey))
+      : new Set<string>();
+
+    const ctx: FireContext = {
+      enemyShipCells: vulnerable,
+      enemySubCells,
+      shooterSub: mySub,
+      direction,
+    };
+    const { hits, misses, reveals } = resolveFire(weaponId, target, ctx);
+
+    const sunkBefore = new Set<ShipClass>();
+    for (const s of oppShips) {
+      if (s.damage && s.damage.every((d) => d)) sunkBefore.add(s.shipClass);
+    }
+
+    for (const h of hits) {
+      const k = cellKey(h);
+      for (const s of oppShips) {
+        const i = s.cells.findIndex((c) => cellKey(c) === k);
+        if (i >= 0) {
+          if (!s.damage) s.damage = s.cells.map(() => false);
+          s.damage[i] = true;
+          break;
+        }
+      }
+    }
+
+    for (const s of oppShips) {
+      if (s.damage && s.damage.every((d) => d) && !sunkBefore.has(s.shipClass)) {
+        this.broadcast("ship_sunk", { ownerId: oppId, shipClass: s.shipClass });
+      }
+    }
+
+    const myH = this.myHits.get(sessionId)!;
+    const myM = this.myMisses.get(sessionId)!;
+    if (weaponId === "torpedo") {
+      const territory: "own" | "enemy" = mySub?.territory ?? "own";
+      const fresh = this.subHitsFresh.get(sessionId)!;
+      const faded = this.subHitsFaded.get(sessionId)!;
+      for (const h of hits) {
+        const k = cellKey(h);
+        faded.delete(k);
+        fresh.set(k, { cell: h, territory });
+      }
+      if (misses.length > 0) {
+        this.torpedoTrails.set(sessionId, {
+          cells: misses,
+          territory: mySub?.territory ?? "own",
+        });
+      }
+    } else {
+      for (const h of hits) myH.set(cellKey(h), h);
+      for (const m of misses) {
+        const k = cellKey(m);
+        if (!myH.has(k)) myM.set(k, m);
+      }
+    }
+    const rev = this.revealedEnemy.get(sessionId)!;
+    for (const r of reveals) rev.set(cellKey(r), r);
+
+    if (have !== -1) inv!.set(weaponId, have - 1);
+    if (client) this.sendInventory(client);
+
+    const oppClient = this.clientFor(oppId);
+    if (oppClient) this.sendFleet(oppClient);
+
+    if (this.isFleetSunk(oppId)) {
+      this.state.phase = "ended";
+      this.state.winnerId = sessionId;
+      const opp = this.state.players.get(oppId);
+      if (opp) opp.alive = false;
+    }
+
+    this.broadcastTerritoryViews();
+    if (this.state.phase === "combat") this.flipTurn();
+  }
+
+  private aiTakeTurn() {
+    if (!this.ai) return;
+    if (this.state.phase !== "combat") return;
+    if (this.state.turnPlayerId !== AI_ID) return;
+    const action = this.ai.takeTurn({
+      fleet: this.placedShips.get(AI_ID) ?? [],
+      ammo: this.ammo.get(AI_ID) ?? new Map(),
+      myHits: this.myHits.get(AI_ID) ?? new Map(),
+      myMisses: this.myMisses.get(AI_ID) ?? new Map(),
+    });
+    if (action.type === "fire") {
+      this.doFire(AI_ID, action.weapon, action.target, action.direction);
+    } else if (action.type === "move_sub") {
+      this.doMoveSub(AI_ID, action.delta);
+    }
+  }
+
   private isFleetSunk(sessionId: string): boolean {
     const ships = this.placedShips.get(sessionId) ?? [];
     if (ships.length === 0) return false;
@@ -279,191 +527,12 @@ export class BattleRoom extends Room<BattleState> {
       }
 
       case "move_sub": {
-        if (this.state.phase !== "combat") {
-          client.send("error", { message: "not in combat" });
-          return;
-        }
-        if (this.state.turnPlayerId !== client.sessionId) {
-          client.send("error", { message: "not your turn" });
-          return;
-        }
-        const placed = this.placedShips.get(client.sessionId) ?? [];
-        const sub = placed.find((s) => s.shipClass === "submarine");
-        if (!sub) { client.send("error", { message: "no submarine" }); return; }
-        if (sub.damage && sub.damage.every((x) => x)) {
-          client.send("error", { message: "submarine destroyed" });
-          return;
-        }
-
-        const d = msg.delta;
-        const stepSum = Math.abs(d.x) + Math.abs(d.y) + Math.abs(d.z);
-        if (stepSum !== 1) { client.send("error", { message: "invalid move" }); return; }
-
-        let newCells = sub.cells.map((c) => ({ x: c.x + d.x, y: c.y + d.y, z: c.z + d.z }));
-        let crossed = false;
-        const offXMin = newCells.some((c) => c.x < 0);
-        const offXMax = newCells.some((c) => c.x >= GRID_SIZE.x);
-        if (offXMin || offXMax) {
-          newCells = sub.cells.map((c) => ({ x: GRID_SIZE.x - 1 - c.x, y: c.y, z: c.z }));
-          crossed = true;
-        }
-
-        for (const c of newCells) {
-          if (c.y < 0 || c.y >= GRID_SIZE.y) { client.send("error", { message: "out of bounds" }); return; }
-          if (c.z < 0 || c.z > 1) { client.send("error", { message: "submarine cannot surface" }); return; }
-        }
-
-        const currentTerritory = sub.territory ?? "own";
-        const newTerritory = crossed ? (currentTerritory === "own" ? "enemy" : "own") : currentTerritory;
-
-        if (newTerritory === "own") {
-          const others = placed.filter((s) => s !== sub);
-          const occupied = new Set(others.flatMap((s) => s.cells.map(cellKey)));
-          for (const c of newCells) {
-            if (occupied.has(cellKey(c))) { client.send("error", { message: "collision" }); return; }
-          }
-        } else {
-          const oppId = this.opponentId(client.sessionId);
-          const oppSub = oppId
-            ? (this.placedShips.get(oppId) ?? []).find(
-                (s) => s.shipClass === "submarine" && (s.territory ?? "own") === "own",
-              )
-            : undefined;
-          if (oppSub) {
-            const occupied = new Set(oppSub.cells.map(cellKey));
-            for (const c of newCells) {
-              if (occupied.has(cellKey(c))) { client.send("error", { message: "submerged collision" }); return; }
-            }
-          }
-        }
-
-        sub.cells = newCells;
-        sub.origin = newCells[0];
-        sub.territory = newTerritory;
-        this.sendFleet(client);
-        this.broadcastTerritoryViews();
-        this.flipTurn();
+        this.doMoveSub(client.sessionId, msg.delta);
         return;
       }
 
       case "fire": {
-        if (this.state.phase !== "combat") return;
-        if (this.state.turnPlayerId !== client.sessionId) {
-          client.send("error", { message: "not your turn" });
-          return;
-        }
-        const weaponId = msg.weapon as WeaponId;
-        const weapon = WEAPONS[weaponId];
-        if (!weapon) { client.send("error", { message: "unknown weapon" }); return; }
-        const inv = this.ammo.get(client.sessionId);
-        const have = inv?.get(weaponId);
-        if (have === undefined || (have !== -1 && have <= 0)) {
-          client.send("error", { message: "out of ammo" });
-          return;
-        }
-
-        const oppId = this.opponentId(client.sessionId);
-        if (!oppId) return;
-        const myPlaced = this.placedShips.get(client.sessionId) ?? [];
-        const oppShips = this.placedShips.get(oppId) ?? [];
-        const vulnerable = new Set<string>();
-        for (const s of oppShips) {
-          if ((s.territory ?? "own") === "own") {
-            s.cells.forEach((c) => vulnerable.add(cellKey(c)));
-          }
-        }
-
-        const mySub = myPlaced.find((s) => s.shipClass === "submarine");
-        const oppSub = oppShips.find((s) => s.shipClass === "submarine");
-        if (weaponId === "torpedo") {
-          if (!mySub || (mySub.damage && mySub.damage.every((x) => x))) {
-            client.send("error", { message: "submarine destroyed" });
-            return;
-          }
-        }
-        const subsInSameWaters =
-          !!mySub && !!oppSub &&
-          ((mySub.territory ?? "own") !== (oppSub.territory ?? "own"));
-        const enemySubCells = subsInSameWaters && oppSub
-          ? new Set(oppSub.cells.map(cellKey))
-          : new Set<string>();
-
-        const ctx: FireContext = {
-          enemyShipCells: vulnerable,
-          enemySubCells,
-          shooterSub: mySub,
-          direction: msg.direction,
-        };
-        const { hits, misses, reveals } = resolveFire(weaponId, msg.target, ctx);
-
-        const sunkBefore = new Set<ShipClass>();
-        for (const s of oppShips) {
-          if (s.damage && s.damage.every((d) => d)) sunkBefore.add(s.shipClass);
-        }
-
-        for (const h of hits) {
-          const k = cellKey(h);
-          for (const s of oppShips) {
-            const i = s.cells.findIndex((c) => cellKey(c) === k);
-            if (i >= 0) {
-              if (!s.damage) s.damage = s.cells.map(() => false);
-              s.damage[i] = true;
-              break;
-            }
-          }
-        }
-
-        for (const s of oppShips) {
-          if (s.damage && s.damage.every((d) => d) && !sunkBefore.has(s.shipClass)) {
-            this.broadcast("ship_sunk", { ownerId: oppId, shipClass: s.shipClass });
-          }
-        }
-
-        const myH = this.myHits.get(client.sessionId)!;
-        const myM = this.myMisses.get(client.sessionId)!;
-        if (weaponId === "torpedo") {
-          const territory: "own" | "enemy" = mySub?.territory ?? "own";
-          const fresh = this.subHitsFresh.get(client.sessionId)!;
-          const faded = this.subHitsFaded.get(client.sessionId)!;
-          for (const h of hits) {
-            const k = cellKey(h);
-            faded.delete(k);
-            fresh.set(k, { cell: h, territory });
-          }
-        } else {
-          for (const h of hits) myH.set(cellKey(h), h);
-        }
-        if (weaponId === "torpedo") {
-          if (misses.length > 0) {
-            this.torpedoTrails.set(client.sessionId, {
-              cells: misses,
-              territory: mySub?.territory ?? "own",
-            });
-          }
-        } else {
-          for (const m of misses) {
-            const k = cellKey(m);
-            if (!myH.has(k)) myM.set(k, m);
-          }
-        }
-        const rev = this.revealedEnemy.get(client.sessionId)!;
-        for (const r of reveals) rev.set(cellKey(r), r);
-
-        if (have !== -1) inv!.set(weaponId, have - 1);
-        this.sendInventory(client);
-
-        const oppClient = this.clientFor(oppId);
-        if (oppClient) this.sendFleet(oppClient);
-
-        if (this.isFleetSunk(oppId)) {
-          this.state.phase = "ended";
-          this.state.winnerId = client.sessionId;
-          const opp = this.state.players.get(oppId);
-          if (opp) opp.alive = false;
-        }
-
-        this.broadcastTerritoryViews();
-        if (this.state.phase === "combat") this.flipTurn();
+        this.doFire(client.sessionId, msg.weapon as WeaponId, msg.target, msg.direction);
         return;
       }
 
